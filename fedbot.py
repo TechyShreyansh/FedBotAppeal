@@ -1,12 +1,15 @@
 import logging
+import os
+import sqlite3
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler, Filters
 from telegram.error import TelegramError
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
-from config import Config
+from dotenv import load_dotenv
 import sys
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -15,42 +18,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Validate configuration
+# --- CONFIG ---
 try:
-    Config.validate()
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
+    ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
+    DB_PATH = os.getenv('DB_PATH', 'appeals.db')
+    
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN environment variable is required")
+    if not ADMIN_ID:
+        raise ValueError("ADMIN_ID environment variable is required")
+        
 except ValueError as e:
     logger.error(f"Configuration error: {e}")
     sys.exit(1)
+except Exception as e:
+    logger.error(f"Unexpected configuration error: {e}")
+    sys.exit(1)
 
 # --- Database Setup ---
-class MongoDB:
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            try:
-                cls._instance.client = MongoClient(Config.MONGO_URI)
-                cls._instance.db = cls._instance.client[Config.DB_NAME]
-                cls._instance.appeals = cls._instance.db['appeals']
-                logger.info("Connected to MongoDB successfully")
-            except PyMongoError as e:
-                logger.error(f"MongoDB connection error: {e}")
-                sys.exit(1)
-        return cls._instance
-
 def init_db():
-    """Initialize database indexes"""
+    """Initialize the database with proper error handling"""
     try:
-        db = MongoDB().db
-        db.appeals.create_index("user_id")
-        db.appeals.create_index("status")
-        db.appeals.create_index("appeal_type")
-        db.appeals.create_index("created_at")
-        logger.info("Database indexes initialized")
-    except PyMongoError as e:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS appeals
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL,
+                     username TEXT,
+                     appeal_type TEXT NOT NULL,
+                     appeal_text TEXT,
+                     status TEXT DEFAULT "pending",
+                     timestamp TEXT NOT NULL,
+                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        conn.commit()
+        logger.info("Database initialized successfully")
+    except sqlite3.Error as e:
         logger.error(f"Database initialization error: {e}")
         sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected database error: {e}")
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+
+def get_db_connection():
+    """Get database connection with error handling"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        return conn
+    except sqlite3.Error as e:
+        logger.error(f"Database connection error: {e}")
+        return None
 
 # --- User Commands ---
 def start(update: Update, context: CallbackContext):
@@ -63,6 +83,8 @@ def start(update: Update, context: CallbackContext):
         logger.info(f"User {update.effective_user.id} started the bot")
     except TelegramError as e:
         logger.error(f"Error in start command: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in start command: {e}")
 
 def appeal(update: Update, context: CallbackContext):
     """Appeal command handler"""
@@ -79,6 +101,8 @@ def appeal(update: Update, context: CallbackContext):
     except TelegramError as e:
         logger.error(f"Error in appeal command: {e}")
         update.message.reply_text("❌ An error occurred. Please try again later.")
+    except Exception as e:
+        logger.error(f"Unexpected error in appeal command: {e}")
 
 # Store temporary data for users writing appeals
 user_appeals = {}
@@ -90,37 +114,50 @@ def handle_appeal_type(update: Update, context: CallbackContext):
         query.answer()
         user = query.from_user
         
+        # Validate appeal type
         if query.data not in ['unban', 'admin']:
             query.edit_message_text("❌ Invalid appeal type")
             return
         
+        # Store appeal type temporarily
         user_appeals[user.id] = {'type': query.data}
         
-        template = (
-            "\n\n📝 Please write your appeal in detail. Example:\n"
-            "1. Why were you banned?\n"
-            "2. What have you learned?\n"
-            "3. Why should we unban you?\n"
-            "4. Any additional information?"
-        ) if query.data == "unban" else (
-            "\n\n📝 Please write your admin request. Example:\n"
-            "1. Why do you want to be an admin?\n"
-            "2. What experience do you have?\n"
-            "3. How will you help the community?\n"
-            "4. Any additional information?"
-        )
+        # Ask for appeal text with template
+        appeal_type = "unban" if query.data == "unban" else "admin request"
+        template = ""
+        
+        if query.data == "unban":
+            template = (
+                "\n\n📝 Please write your appeal in detail. Example:\n"
+                "1. Why were you banned?\n"
+                "2. What have you learned from this experience?\n"
+                "3. Why should we unban you?\n"
+                "4. Any additional information?"
+            )
+        else:
+            template = (
+                "\n\n📝 Please write your admin request. Example:\n"
+                "1. Why do you want to be an admin?\n"
+                "2. What experience do you have?\n"
+                "3. How will you help the community?\n"
+                "4. Any additional information?"
+            )
             
         query.edit_message_text(
-            f"✍️ Please write and submit your {'unban' if query.data == 'unban' else 'admin request'} appeal.{template}\n\n"
+            f"✍️ Please write and submit your {appeal_type} appeal.{template}\n\n"
             "Type your appeal now:"
         )
         
+        # Set next step to handle appeal text
         context.user_data['expecting_appeal_text'] = True
         context.user_data['appeal_type'] = query.data
+        
         logger.info(f"User {user.id} selected {query.data} appeal type")
             
     except TelegramError as e:
         logger.error(f"Telegram error in handle_appeal_type: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in handle_appeal_type: {e}")
 
 def handle_appeal_text(update: Update, context: CallbackContext):
     """Handle user's appeal text submission"""
@@ -132,67 +169,81 @@ def handle_appeal_text(update: Update, context: CallbackContext):
         appeal_text = update.message.text
         appeal_type = context.user_data['appeal_type']
         
-        try:
-            db = MongoDB().db
-            appeal_data = {
-                "user_id": user.id,
-                "username": user.username or f"{user.first_name or ''} {user.last_name or ''}".strip(),
-                "appeal_type": appeal_type,
-                "appeal_text": appeal_text,
-                "status": "pending",
-                "created_at": datetime.utcnow(),
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            }
+        # Save to database
+        conn = get_db_connection()
+        if not conn:
+            update.message.reply_text("❌ Database error. Please try again later.")
+            return
             
-            result = db.appeals.insert_one(appeal_data)
-            appeal_id = str(result.inserted_id)
+        try:
+            c = conn.cursor()
+            c.execute('''INSERT INTO appeals 
+                        (user_id, username, appeal_type, appeal_text, timestamp)
+                        VALUES (?, ?, ?, ?, ?)''',
+                     (user.id, user.username or 'No username', appeal_type, appeal_text,
+                      datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+            appeal_id = c.lastrowid
             
             update.message.reply_text(
                 f"✅ {appeal_type.capitalize()} appeal submitted successfully!\n"
-                f"Appeal ID: {appeal_id}\n\n"
+                f"Appeal ID: #{appeal_id}\n\n"
                 "Your appeal will be reviewed by an admin."
             )
             
+            # Notify admin with detailed information
             try:
                 context.bot.send_message(
-                    Config.ADMIN_ID,
-                    f"🚨 New Appeal {appeal_id}\n"
-                    f"User: {appeal_data['username']} (ID: {user.id})\n"
+                    ADMIN_ID,
+                    f"🚨 New Appeal #{appeal_id}\n"
+                    f"User: @{user.username or 'No username'} (ID: {user.id})\n"
                     f"Type: {appeal_type.capitalize()}\n"
-                    f"Time: {appeal_data['timestamp']}\n\n"
+                    f"Time: {datetime.now().strftime('%H:%M %d-%m-%Y')}\n\n"
                     f"📝 Appeal Text:\n{appeal_text}\n\n"
                     f"Use /approve {appeal_id} to approve\n"
                     f"Use /reject {appeal_id} to reject\n\n"
                     f"Use /pending to view all pending appeals"
                 )
+                logger.info(f"Admin notified about appeal #{appeal_id}")
             except TelegramError as e:
                 logger.error(f"Failed to notify admin: {e}")
                 
-            logger.info(f"Appeal {appeal_id} submitted by user {user.id}")
+            logger.info(f"Appeal #{appeal_id} submitted by user {user.id}")
             
+            # Clean up user data
             del context.user_data['expecting_appeal_text']
             del context.user_data['appeal_type']
             if user.id in user_appeals:
                 del user_appeals[user.id]
                 
-        except PyMongoError as e:
+        except sqlite3.Error as e:
             logger.error(f"Database error in handle_appeal_text: {e}")
             update.message.reply_text("❌ Database error. Please try again later.")
+        finally:
+            conn.close()
             
     except TelegramError as e:
         logger.error(f"Telegram error in handle_appeal_text: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in handle_appeal_text: {e}")
 
 # --- Admin Commands ---
 def pending(update: Update, context: CallbackContext):
     """Show pending appeals (admin only)"""
     try:
-        if update.effective_user.id != Config.ADMIN_ID:
+        if update.effective_user.id != ADMIN_ID:
             update.message.reply_text("❌ Access denied.")
             return
             
+        conn = get_db_connection()
+        if not conn:
+            update.message.reply_text("❌ Database error. Please try again later.")
+            return
+            
         try:
-            db = MongoDB().db
-            appeals = list(db.appeals.find({"status": "pending"}).sort("created_at", -1).limit(50))
+            c = conn.cursor()
+            c.execute("SELECT * FROM appeals WHERE status='pending' ORDER BY id DESC")
+            appeals = c.fetchall()
             
             if not appeals:
                 update.message.reply_text("📋 No pending appeals!")
@@ -201,30 +252,39 @@ def pending(update: Update, context: CallbackContext):
             response = "📋 Pending Appeals:\n\n"
             for appeal in appeals:
                 response += (
-                    f"ID: {appeal['_id']}\n"
-                    f"User: {appeal['username']} (ID: {appeal['user_id']})\n"
-                    f"Type: {appeal['appeal_type'].capitalize()}\n"
-                    f"Time: {appeal['timestamp']}\n"
-                    f"Text: {appeal['appeal_text'][:100]}...\n"
+                    f"ID: #{appeal[0]}\n"
+                    f"User: @{appeal[2]} (ID: {appeal[1]})\n"
+                    f"Type: {appeal[3].capitalize()}\n"
+                    f"Time: {appeal[6]}\n"
+                    f"Status: {appeal[5]}\n"
+                    f"Text: {appeal[4][:100]}...\n"
                     "───────────────\n"
                 )
             
-            for i in range(0, len(response), 4096):
-                update.message.reply_text(response[i:i+4096])
+            # Split long messages if needed
+            if len(response) > 4096:
+                for i in range(0, len(response), 4096):
+                    update.message.reply_text(response[i:i+4096])
+            else:
+                update.message.reply_text(response)
                 
             logger.info(f"Admin {update.effective_user.id} viewed pending appeals")
             
-        except PyMongoError as e:
+        except sqlite3.Error as e:
             logger.error(f"Database error in pending: {e}")
             update.message.reply_text("❌ Database error. Please try again later.")
+        finally:
+            conn.close()
             
     except TelegramError as e:
         logger.error(f"Telegram error in pending: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in pending: {e}")
 
 def view_appeal(update: Update, context: CallbackContext):
     """View full appeal details (admin only)"""
     try:
-        if update.effective_user.id != Config.ADMIN_ID:
+        if update.effective_user.id != ADMIN_ID:
             update.message.reply_text("❌ Access denied.")
             return
             
@@ -232,41 +292,55 @@ def view_appeal(update: Update, context: CallbackContext):
             update.message.reply_text("❌ Usage: /view <appeal_id>")
             return
             
-        appeal_id = context.args[0]
+        try:
+            appeal_id = int(context.args[0])
+        except ValueError:
+            update.message.reply_text("❌ Invalid appeal ID. Please provide a number.")
+            return
+            
+        conn = get_db_connection()
+        if not conn:
+            update.message.reply_text("❌ Database error. Please try again later.")
+            return
             
         try:
-            db = MongoDB().db
-            appeal = db.appeals.find_one({"_id": appeal_id})
+            c = conn.cursor()
+            c.execute("SELECT * FROM appeals WHERE id=?", (appeal_id,))
+            appeal = c.fetchone()
             
             if not appeal:
-                update.message.reply_text(f"❌ Appeal {appeal_id} not found.")
+                update.message.reply_text(f"❌ Appeal #{appeal_id} not found.")
                 return
                 
             response = (
-                f"📄 Appeal Details {appeal['_id']}\n"
-                f"User: {appeal['username']} (ID: {appeal['user_id']})\n"
-                f"Type: {appeal['appeal_type'].capitalize()}\n"
-                f"Status: {appeal['status']}\n"
-                f"Time: {appeal['timestamp']}\n\n"
-                f"📝 Appeal Text:\n{appeal['appeal_text']}\n\n"
-                f"Use /approve {appeal['_id']} to approve\n"
-                f"Use /reject {appeal['_id']} to reject"
+                f"📄 Appeal Details #{appeal[0]}\n"
+                f"User: @{appeal[2]} (ID: {appeal[1]})\n"
+                f"Type: {appeal[3].capitalize()}\n"
+                f"Status: {appeal[5]}\n"
+                f"Time: {appeal[6]}\n\n"
+                f"📝 Appeal Text:\n{appeal[4]}\n\n"
+                f"Use /approve {appeal[0]} to approve\n"
+                f"Use /reject {appeal[0]} to reject"
             )
             
             update.message.reply_text(response)
-            logger.info(f"Admin viewed appeal {appeal_id}")
+            logger.info(f"Admin viewed appeal #{appeal_id}")
             
-        except PyMongoError as e:
+        except sqlite3.Error as e:
             logger.error(f"Database error in view_appeal: {e}")
             update.message.reply_text("❌ Database error. Please try again later.")
+        finally:
+            conn.close()
             
     except TelegramError as e:
         logger.error(f"Telegram error in view_appeal: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in view_appeal: {e}")
 
 def approve(update: Update, context: CallbackContext):
     """Approve appeal (admin only)"""
     try:
-        if update.effective_user.id != Config.ADMIN_ID:
+        if update.effective_user.id != ADMIN_ID:
             update.message.reply_text("❌ Access denied.")
             return
             
@@ -274,47 +348,66 @@ def approve(update: Update, context: CallbackContext):
             update.message.reply_text("❌ Usage: /approve <appeal_id>")
             return
             
-        appeal_id = context.args[0]
+        try:
+            appeal_id = int(context.args[0])
+        except ValueError:
+            update.message.reply_text("❌ Invalid appeal ID. Please provide a number.")
+            return
+            
+        conn = get_db_connection()
+        if not conn:
+            update.message.reply_text("❌ Database error. Please try again later.")
+            return
             
         try:
-            db = MongoDB().db
-            appeal = db.appeals.find_one_and_update(
-                {"_id": appeal_id, "status": "pending"},
-                {"$set": {"status": "approved"}},
-                return_document=True
-            )
+            c = conn.cursor()
             
-            if not appeal:
-                update.message.reply_text(f"❌ Appeal {appeal_id} not found or already processed.")
+            # Check if appeal exists
+            c.execute("SELECT user_id, appeal_type, appeal_text FROM appeals WHERE id=? AND status='pending'", (appeal_id,))
+            result = c.fetchone()
+            
+            if not result:
+                update.message.reply_text(f"❌ Appeal #{appeal_id} not found or already processed.")
                 return
                 
-            update.message.reply_text(f"✅ Appeal {appeal_id} approved successfully!")
+            user_id, appeal_type, appeal_text = result
             
+            # Update database
+            c.execute("UPDATE appeals SET status='approved' WHERE id=?", (appeal_id,))
+            conn.commit()
+            
+            update.message.reply_text(f"✅ Appeal #{appeal_id} approved successfully!")
+            
+            # Notify user
             try:
                 context.bot.send_message(
-                    appeal['user_id'], 
-                    f"🎉 Your {appeal['appeal_type']} appeal has been approved!\n"
-                    f"Appeal ID: {appeal_id}\n\n"
-                    f"Your appeal text:\n{appeal['appeal_text']}"
+                    user_id, 
+                    f"🎉 Your {appeal_type} appeal has been approved!\n"
+                    f"Appeal ID: #{appeal_id}\n\n"
+                    f"Your appeal text:\n{appeal_text}"
                 )
-                logger.info(f"User {appeal['user_id']} notified about approved appeal {appeal_id}")
+                logger.info(f"User {user_id} notified about approved appeal #{appeal_id}")
             except TelegramError as e:
-                logger.error(f"Failed to notify user {appeal['user_id']}: {e}")
+                logger.error(f"Failed to notify user {user_id}: {e}")
                 update.message.reply_text(f"Appeal approved but failed to notify user.")
                 
-            logger.info(f"Appeal {appeal_id} approved by admin {update.effective_user.id}")
+            logger.info(f"Appeal #{appeal_id} approved by admin {update.effective_user.id}")
             
-        except PyMongoError as e:
+        except sqlite3.Error as e:
             logger.error(f"Database error in approve: {e}")
             update.message.reply_text("❌ Database error. Please try again later.")
+        finally:
+            conn.close()
             
     except TelegramError as e:
         logger.error(f"Telegram error in approve: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in approve: {e}")
 
 def reject(update: Update, context: CallbackContext):
     """Reject appeal (admin only)"""
     try:
-        if update.effective_user.id != Config.ADMIN_ID:
+        if update.effective_user.id != ADMIN_ID:
             update.message.reply_text("❌ Access denied.")
             return
             
@@ -322,75 +415,101 @@ def reject(update: Update, context: CallbackContext):
             update.message.reply_text("❌ Usage: /reject <appeal_id>")
             return
             
-        appeal_id = context.args[0]
+        try:
+            appeal_id = int(context.args[0])
+        except ValueError:
+            update.message.reply_text("❌ Invalid appeal ID. Please provide a number.")
+            return
+            
+        conn = get_db_connection()
+        if not conn:
+            update.message.reply_text("❌ Database error. Please try again later.")
+            return
             
         try:
-            db = MongoDB().db
-            appeal = db.appeals.find_one_and_update(
-                {"_id": appeal_id, "status": "pending"},
-                {"$set": {"status": "rejected"}},
-                return_document=True
-            )
+            c = conn.cursor()
             
-            if not appeal:
-                update.message.reply_text(f"❌ Appeal {appeal_id} not found or already processed.")
+            # Check if appeal exists
+            c.execute("SELECT user_id, appeal_type, appeal_text FROM appeals WHERE id=? AND status='pending'", (appeal_id,))
+            result = c.fetchone()
+            
+            if not result:
+                update.message.reply_text(f"❌ Appeal #{appeal_id} not found or already processed.")
                 return
                 
-            update.message.reply_text(f"❌ Appeal {appeal_id} rejected.")
+            user_id, appeal_type, appeal_text = result
             
+            # Update database
+            c.execute("UPDATE appeals SET status='rejected' WHERE id=?", (appeal_id,))
+            conn.commit()
+            
+            update.message.reply_text(f"❌ Appeal #{appeal_id} rejected.")
+            
+            # Notify user
             try:
                 context.bot.send_message(
-                    appeal['user_id'], 
-                    f"❌ Your {appeal['appeal_type']} appeal has been rejected.\n"
-                    f"Appeal ID: {appeal_id}\n\n"
-                    f"Your appeal text:\n{appeal['appeal_text']}\n\n"
+                    user_id, 
+                    f"❌ Your {appeal_type} appeal has been rejected.\n"
+                    f"Appeal ID: #{appeal_id}\n\n"
+                    f"Your appeal text:\n{appeal_text}\n\n"
                     "You may submit a new appeal if you wish."
                 )
-                logger.info(f"User {appeal['user_id']} notified about rejected appeal {appeal_id}")
+                logger.info(f"User {user_id} notified about rejected appeal #{appeal_id}")
             except TelegramError as e:
-                logger.error(f"Failed to notify user {appeal['user_id']}: {e}")
+                logger.error(f"Failed to notify user {user_id}: {e}")
                 update.message.reply_text(f"Appeal rejected but failed to notify user.")
                 
-            logger.info(f"Appeal {appeal_id} rejected by admin {update.effective_user.id}")
+            logger.info(f"Appeal #{appeal_id} rejected by admin {update.effective_user.id}")
             
-        except PyMongoError as e:
+        except sqlite3.Error as e:
             logger.error(f"Database error in reject: {e}")
             update.message.reply_text("❌ Database error. Please try again later.")
+        finally:
+            conn.close()
             
     except TelegramError as e:
         logger.error(f"Telegram error in reject: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in reject: {e}")
 
 def stats(update: Update, context: CallbackContext):
     """Show appeal statistics (admin only)"""
     try:
-        if update.effective_user.id != Config.ADMIN_ID:
+        if update.effective_user.id != ADMIN_ID:
             update.message.reply_text("❌ Access denied.")
             return
             
+        conn = get_db_connection()
+        if not conn:
+            update.message.reply_text("❌ Database error. Please try again later.")
+            return
+            
         try:
-            db = MongoDB().db
+            c = conn.cursor()
             
             # Get basic stats
-            total = db.appeals.count_documents({})
-            pending = db.appeals.count_documents({"status": "pending"})
-            approved = db.appeals.count_documents({"status": "approved"})
-            rejected = db.appeals.count_documents({"status": "rejected"})
+            c.execute("SELECT COUNT(*) FROM appeals")
+            total = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM appeals WHERE status='pending'")
+            pending = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM appeals WHERE status='approved'")
+            approved = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM appeals WHERE status='rejected'")
+            rejected = c.fetchone()[0]
             
             # Get appeal type distribution
-            type_stats = []
-            for stat in db.appeals.aggregate([
-                {"$group": {"_id": "$appeal_type", "count": {"$sum": 1}}}
-            ]):
-                type_stats.append(f"• {stat['_id'].capitalize()}: {stat['count']}")
+            c.execute("SELECT appeal_type, COUNT(*) FROM appeals GROUP BY appeal_type")
+            type_stats = "\n".join([f"• {row[0].capitalize()}: {row[1]}" for row in c.fetchall()])
             
             # Get recent activity
-            last_24h = db.appeals.count_documents({
-                "created_at": {"$gte": datetime.utcnow() - timedelta(days=1)}
-            })
+            c.execute("SELECT COUNT(*) FROM appeals WHERE created_at >= datetime('now', '-1 day')")
+            last_24h = c.fetchone()[0]
             
-            last_7d = db.appeals.count_documents({
-                "created_at": {"$gte": datetime.utcnow() - timedelta(days=7)}
-            })
+            c.execute("SELECT COUNT(*) FROM appeals WHERE created_at >= datetime('now', '-7 days')")
+            last_7d = c.fetchone()[0]
             
             response = (
                 "📊 <b>Appeal Statistics</b>\n\n"
@@ -402,19 +521,23 @@ def stats(update: Update, context: CallbackContext):
                 f"• Last 24h: {last_24h}\n"
                 f"• Last 7 days: {last_7d}\n\n"
                 f"<b>By Appeal Type:</b>\n"
-                f"{'\n'.join(type_stats)}\n\n"
+                f"{type_stats}\n\n"
                 "Use /pending to view pending appeals"
             )
             
             update.message.reply_text(response, parse_mode='HTML')
             logger.info(f"Admin {update.effective_user.id} viewed statistics")
             
-        except PyMongoError as e:
+        except sqlite3.Error as e:
             logger.error(f"Database error in stats: {e}")
             update.message.reply_text("❌ Database error. Please try again later.")
+        finally:
+            conn.close()
             
     except TelegramError as e:
         logger.error(f"Telegram error in stats: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in stats: {e}")
 
 def error_handler(update: Update, context: CallbackContext):
     """Global error handler"""
@@ -428,7 +551,7 @@ def main():
         init_db()
         
         # Create updater
-        updater = Updater(Config.BOT_TOKEN, use_context=True)
+        updater = Updater(BOT_TOKEN, use_context=True)
         dp = updater.dispatcher
         
         # User commands
