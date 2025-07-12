@@ -1,6 +1,6 @@
 # ⚡️ Federation Appeals Bot
 
-![FederationAppeals](#)
+![FederationAppeals](https://cdn.jsdelivr.net/gh/TechyShreyansh/TechyShreyansh@main/Images/fedbot.png)
 
 [![Open Source Love](https://badges.frapsoft.com/os/v2/open-source.png?v=103)](https://github.com/techyshreyansh/FederationBot)
 [![Maintenance](https://img.shields.io/badge/Maintained%3F-Yes-green)](https://github.com/techyshreyansh/FederationBot/graphs/commit-activity)
